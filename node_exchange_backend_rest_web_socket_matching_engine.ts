@@ -23,6 +23,8 @@
  */
 
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import express, { Request, Response } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import cors from 'cors';
@@ -61,6 +63,8 @@ interface Trade {
   sellOrderId: string;
 }
 
+type OrderStatus = 'OPEN' | 'PARTIAL' | 'FILLED' | 'CANCELLED';
+
 // FIFO queue at each price level
 interface PriceLevel {
   price: number;
@@ -78,6 +82,202 @@ interface OrderBook {
 const books: Record<string, OrderBook> = {};
 const liveOrders = new Map<string, Order>();
 const recentTrades: Record<string, Trade[]> = {}; // symbol -> trades (most recent first)
+
+interface StoredOrder {
+  id: string;
+  symbol: string;
+  side: Side;
+  type: OrderType;
+  price: number;
+  qty: number;
+  remaining: number;
+  tif: TIF;
+  status: OrderStatus;
+  ts: number;
+  updatedAt: number;
+}
+
+interface StoredTrade extends Trade {}
+
+interface DatabaseShape {
+  orders: Record<string, StoredOrder>;
+  trades: StoredTrade[];
+}
+
+class DiskDatabase {
+  private data: DatabaseShape;
+  private readonly file: string;
+
+  constructor(file: string) {
+    this.file = file;
+    this.data = { orders: {}, trades: [] };
+    this.load();
+  }
+
+  private load() {
+    try {
+      if (fs.existsSync(this.file)) {
+        const raw = fs.readFileSync(this.file, 'utf8');
+        const parsed = JSON.parse(raw) as DatabaseShape;
+        // basic validation
+        if (parsed && typeof parsed === 'object') {
+          this.data = {
+            orders: parsed.orders || {},
+            trades: Array.isArray(parsed.trades) ? parsed.trades : [],
+          };
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load database, starting with empty state', err);
+      this.data = { orders: {}, trades: [] };
+    }
+  }
+
+  private persist() {
+    const tmp = `${this.file}.tmp`;
+    const payload = JSON.stringify(this.data, null, 2);
+    fs.writeFileSync(tmp, payload);
+    fs.renameSync(tmp, this.file);
+  }
+
+  upsertOrder(order: StoredOrder) {
+    this.data.orders[order.id] = { ...order };
+    this.persist();
+  }
+
+  getOrder(id: string): StoredOrder | undefined {
+    return this.data.orders[id];
+  }
+
+  listOrders(options: { symbol?: string | null; statuses?: OrderStatus[]; limit?: number } = {}): StoredOrder[] {
+    const { symbol, statuses, limit = 500 } = options;
+    const statusSet = statuses ? new Set(statuses) : null;
+    const out = Object.values(this.data.orders)
+      .filter(o => (!symbol || o.symbol === symbol) && (!statusSet || statusSet.has(o.status)))
+      .sort((a, b) => a.ts - b.ts);
+    if (out.length > limit) return out.slice(out.length - limit);
+    return out;
+  }
+
+  recordTrade(trade: StoredTrade) {
+    this.data.trades.push({ ...trade });
+    // keep history bounded for memory/file size
+    const maxTrades = 10000;
+    if (this.data.trades.length > maxTrades) {
+      this.data.trades.splice(0, this.data.trades.length - maxTrades);
+    }
+    this.persist();
+  }
+
+  recentTrades(symbol: string, limit: number): StoredTrade[] {
+    const result: StoredTrade[] = [];
+    for (let i = this.data.trades.length - 1; i >= 0 && result.length < limit; i -= 1) {
+      const tr = this.data.trades[i];
+      if (tr.symbol === symbol) result.push(tr);
+    }
+    return result;
+  }
+
+  candles(symbol: string, intervalSec: number, limit: number) {
+    const intervalMs = Math.max(1, intervalSec) * 1000;
+    const relevant = this.data.trades.filter(t => t.symbol === symbol);
+    if (relevant.length === 0) return [] as { startTime: number; open: number; high: number; low: number; close: number; volume: number }[];
+    relevant.sort((a, b) => a.ts - b.ts);
+    const buckets = new Map<number, { startTime: number; open: number; high: number; low: number; close: number; volume: number }>();
+    for (const tr of relevant) {
+      const bucketStart = Math.floor(tr.ts / intervalMs) * intervalMs;
+      let bucket = buckets.get(bucketStart);
+      if (!bucket) {
+        bucket = { startTime: bucketStart, open: tr.price, high: tr.price, low: tr.price, close: tr.price, volume: tr.qty };
+        buckets.set(bucketStart, bucket);
+      } else {
+        bucket.high = Math.max(bucket.high, tr.price);
+        bucket.low = Math.min(bucket.low, tr.price);
+        bucket.close = tr.price;
+        bucket.volume += tr.qty;
+      }
+    }
+    const arr = Array.from(buckets.values()).sort((a, b) => a.startTime - b.startTime);
+    if (arr.length > limit) return arr.slice(arr.length - limit);
+    return arr;
+  }
+
+  snapshot(): DatabaseShape {
+    return {
+      orders: { ...this.data.orders },
+      trades: [...this.data.trades],
+    };
+  }
+}
+
+const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), 'data');
+fs.mkdirSync(dataDir, { recursive: true });
+const databaseFile = path.join(dataDir, 'exchange-db.json');
+const diskDb = new DiskDatabase(databaseFile);
+
+function orderStatusFrom(order: Order, explicit?: OrderStatus): OrderStatus {
+  if (explicit) return explicit;
+  if (order.remaining <= 0) return 'FILLED';
+  if (order.remaining < order.qty) return 'PARTIAL';
+  return 'OPEN';
+}
+
+function persistOrder(order: Order, status?: OrderStatus) {
+  const record: StoredOrder = {
+    id: order.id,
+    symbol: order.symbol,
+    side: order.side,
+    type: order.type,
+    price: order.price,
+    qty: order.qty,
+    remaining: order.remaining,
+    tif: order.tif,
+    status: orderStatusFrom(order, status),
+    ts: order.ts,
+    updatedAt: Date.now(),
+  };
+  diskDb.upsertOrder(record);
+}
+
+function persistTrade(trade: Trade) {
+  diskDb.recordTrade({ ...trade });
+}
+
+function hydrateStateFromDisk() {
+  const snapshot = diskDb.snapshot();
+  const openOrders = Object.values(snapshot.orders).filter(o => o.status === 'OPEN' || o.status === 'PARTIAL');
+  openOrders.sort((a, b) => a.ts - b.ts);
+  for (const row of openOrders) {
+    const order: Order = {
+      id: row.id,
+      symbol: row.symbol,
+      side: row.side,
+      type: row.type,
+      price: row.price,
+      qty: row.qty,
+      remaining: row.remaining,
+      tif: row.tif,
+      ts: row.ts,
+    };
+    if (order.remaining > 0) {
+      const ob = getBook(order.symbol);
+      addToBook(ob, order);
+      liveOrders.set(order.id, order);
+    }
+  }
+
+  const tradesBySymbol: Record<string, Trade[]> = {};
+  for (const tr of snapshot.trades) {
+    const list = tradesBySymbol[tr.symbol] || (tradesBySymbol[tr.symbol] = []);
+    list.push({ ...tr });
+  }
+  for (const [symbol, list] of Object.entries(tradesBySymbol)) {
+    list.sort((a, b) => b.ts - a.ts);
+    recentTrades[symbol] = list.slice(0, 500);
+  }
+}
+
+hydrateStateFromDisk();
 
 function getBook(symbol: string): OrderBook {
   if (!books[symbol]) {
@@ -113,6 +313,7 @@ function recordTrade(symbol: string, price: number, qty: number, buyOrderId: str
   const list = recentTrades[symbol] || (recentTrades[symbol] = []);
   list.unshift(tr);
   if (list.length > 500) list.pop();
+  persistTrade(tr);
   broadcast(symbol, { type: 'trade', symbol, payload: tr });
   return tr;
 }
@@ -152,6 +353,9 @@ function matchIncoming(ob: OrderBook, incoming: Order): Trade[] {
       incoming.remaining -= execQty;
       resting.remaining -= execQty;
 
+      persistOrder(resting, resting.remaining <= 0 ? 'FILLED' : undefined);
+      persistOrder(incoming, incoming.remaining <= 0 ? 'FILLED' : undefined);
+
       if (resting.remaining <= 0) {
         lvl.queue.shift();
         liveOrders.delete(resting.id);
@@ -178,7 +382,9 @@ function placeOrder(o: Omit<Order, 'id' | 'remaining' | 'ts'>): { order: Order; 
     if (order.type === 'MARKET') {
       // MARKET unfilled remainder is cancelled
       order.remaining = 0;
-      return { order, trades, status: trades.length ? 'PARTIAL' : 'CANCELLED' };
+      const status = trades.length ? 'PARTIAL' : 'CANCELLED';
+      persistOrder(order, status);
+      return { order, trades, status };
     }
     // LIMIT order: check TIF
     if (order.tif === 'FOK') {
@@ -186,23 +392,30 @@ function placeOrder(o: Omit<Order, 'id' | 'remaining' | 'ts'>): { order: Order; 
       if (trades.length === 0 || order.remaining > 0) {
         // revert nothing needs revert because we never rested it
         order.remaining = 0; // indicate not resting
-        return { order, trades, status: trades.length ? 'PARTIAL' : 'CANCELLED' };
+        const status = trades.length ? 'PARTIAL' : 'CANCELLED';
+        persistOrder(order, status);
+        return { order, trades, status };
       }
     }
     if (order.tif === 'IOC') {
       // cancel remainder
       order.remaining = 0;
-      return { order, trades, status: trades.length ? 'PARTIAL' : 'CANCELLED' };
+      const status = trades.length ? 'PARTIAL' : 'CANCELLED';
+      persistOrder(order, status);
+      return { order, trades, status };
     }
     // GTC: rest the remainder on the book
     addToBook(ob, order);
     liveOrders.set(order.id, order);
     pushBook(ob.symbol);
-    return { order, trades, status: trades.length ? 'PARTIAL' : 'OPEN' };
+    const status = trades.length ? 'PARTIAL' : 'OPEN';
+    persistOrder(order, status);
+    return { order, trades, status };
   }
 
   // fully filled
   pushBook(ob.symbol);
+  persistOrder(order, 'FILLED');
   return { order, trades, status: 'FILLED' };
 }
 
@@ -219,6 +432,7 @@ function cancelOrder(id: string): { ok: boolean; reason?: string; order?: Order 
   liveOrders.delete(id);
   cleanLevel(sideMap, o.price);
   pushBook(o.symbol);
+  persistOrder(o, 'CANCELLED');
   return { ok: true, order: o };
 }
 
@@ -263,6 +477,14 @@ function parseSymbol(s: any): string | null {
   return t;
 }
 
+function parseStatuses(raw: any): OrderStatus[] | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const allowed: OrderStatus[] = ['OPEN', 'PARTIAL', 'FILLED', 'CANCELLED'];
+  const requested = raw.split(',').map(x => x.trim().toUpperCase()).filter(Boolean) as OrderStatus[];
+  const filtered = requested.filter(x => allowed.includes(x));
+  return filtered.length ? filtered : undefined;
+}
+
 app.get('/', (_req, res) => res.json({ ok: true, service: 'exchange-backend', time: Date.now() }));
 
 app.post('/orders', (req: Request, res: Response) => {
@@ -292,10 +514,35 @@ app.post('/orders', (req: Request, res: Response) => {
   }
 });
 
+app.get('/orders', (req, res) => {
+  const symbol = req.query.symbol ? parseSymbol(req.query.symbol) : null;
+  if (req.query.symbol && !symbol) return res.status(400).json({ error: 'INVALID_SYMBOL' });
+  const statuses = parseStatuses(req.query.status);
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+  const list = diskDb.listOrders({ symbol: symbol ?? undefined, statuses, limit });
+  return res.json(list);
+});
+
 app.get('/orders/:id', (req, res) => {
-  const o = liveOrders.get(req.params.id);
-  if (!o) return res.status(404).json({ error: 'NOT_FOUND' });
-  return res.json(o);
+  const stored = diskDb.getOrder(req.params.id);
+  if (stored) return res.json(stored);
+  const live = liveOrders.get(req.params.id);
+  if (live) {
+    return res.json({
+      id: live.id,
+      symbol: live.symbol,
+      side: live.side,
+      type: live.type,
+      price: live.price,
+      qty: live.qty,
+      remaining: live.remaining,
+      tif: live.tif,
+      status: orderStatusFrom(live),
+      ts: live.ts,
+      updatedAt: Date.now(),
+    });
+  }
+  return res.status(404).json({ error: 'NOT_FOUND' });
 });
 
 app.delete('/orders/:id', (req, res) => {
@@ -315,8 +562,17 @@ app.get('/trades', (req, res) => {
   const symbol = parseSymbol(req.query.symbol);
   if (!symbol) return res.status(400).json({ error: 'INVALID_SYMBOL' });
   const n = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
-  const list = (recentTrades[symbol] || []).slice(0, n);
+  const list = diskDb.recentTrades(symbol, n);
   return res.json(list);
+});
+
+app.get('/candles', (req, res) => {
+  const symbol = parseSymbol(req.query.symbol);
+  if (!symbol) return res.status(400).json({ error: 'INVALID_SYMBOL' });
+  const interval = Math.max(1, Math.min(24 * 60 * 60, Number(req.query.interval) || 60));
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 120));
+  const candles = diskDb.candles(symbol, interval, limit);
+  return res.json(candles);
 });
 
 // ----------------------------- WebSockets ------------------------------
